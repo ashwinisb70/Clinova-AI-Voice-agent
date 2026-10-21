@@ -1,0 +1,161 @@
+﻿import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom'
+import { AuthProvider } from './context/AuthContext'
+import { ToastProvider } from './context/ToastContext'
+import { LanguageProvider } from './context/LanguageContext'
+import { ThemeProvider } from './context/ThemeContext'
+import { ProtectedRoute } from './components/ProtectedRoute'
+import { ToastContainer } from './components/ToastContainer'
+
+// Pages
+import LandingPage from './pages/LandingPage'
+import LoginPage from './pages/LoginPage'
+import SignupPage from './pages/SignupPage'
+import Dashboard from './pages/Dashboard'
+import Patients from './pages/Patients'
+import Doctors from './pages/Doctors'
+import Departments from './pages/Departments'
+import Appointments from './pages/Appointments'
+import PatientProfile from './pages/PatientProfile'
+import Billing from './pages/Billing'
+import Payments from './pages/Payments'
+import Notifications from './pages/Notifications'
+import History from './pages/History'
+import Email from './pages/Email'
+import ProfilePage from './pages/ProfilePage'
+import HospitalSettings from './pages/HospitalSettings'
+
+function App() {
+  return (
+    <Router>
+      <AuthProvider>
+        <LanguageProvider>
+          <ThemeProvider>
+            <ToastProvider>
+              <Routes>
+              {/* Public Routes */}
+              <Route path="/" element={<LandingPage />} />
+              <Route path="/login" element={<LoginPage />} />
+              <Route path="/signup" element={<SignupPage />} />
+
+              {/* Protected Routes */}
+            <Route
+              path="/dashboard"
+              element={
+                <ProtectedRoute>
+                  <Dashboard />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/patients"
+              element={
+                <ProtectedRoute>
+                  <Patients />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/patients/:id"
+              element={
+                <ProtectedRoute>
+                  <PatientProfile />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/doctors"
+              element={
+                <ProtectedRoute>
+                  <Doctors />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/departments"
+              element={
+                <ProtectedRoute>
+                  <Departments />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/appointments"
+              element={
+                <ProtectedRoute>
+                  <Appointments />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/billing"
+              element={
+                <ProtectedRoute>
+                  <Billing />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/payments"
+              element={
+                <ProtectedRoute>
+                  <Payments />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/notifications"
+              element={
+                <ProtectedRoute>
+                  <Notifications />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/history"
+              element={
+                <ProtectedRoute>
+                  <History />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/email"
+              element={
+                <ProtectedRoute>
+                  <Email />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/profile"
+              element={
+                <ProtectedRoute>
+                  <ProfilePage />
+                </ProtectedRoute>
+              }
+            />
+
+            <Route
+              path="/hospital-settings"
+              element={
+                <ProtectedRoute requiredRole="admin">
+                  <HospitalSettings />
+                </ProtectedRoute>
+              }
+            />
+              {/* Catch all */}
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+
+            {/* Toast Container */}
+            <ToastContainer />
+            </ToastProvider>
+          </ThemeProvider>
+        </LanguageProvider>
+      </AuthProvider>
+    </Router>
+  )
+}
+
+export default App
+

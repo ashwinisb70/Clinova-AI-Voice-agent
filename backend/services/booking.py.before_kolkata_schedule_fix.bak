@@ -1,0 +1,181 @@
+﻿"""Appointment creation shared by POST /book-appointment (patients + Bolna agent)."""
+from datetime import date, datetime
+import re
+
+from fastapi import HTTPException
+
+from database import appointments_collection, departments_collection, doctors_collection, patients_collection, invoices_collection
+from services.common import now, short_id, parse_date
+from services.notify import create_notification, email_patient, appt_params
+
+ACTIVE_STATUSES = ["pending", "confirmed", "rescheduled", "scheduled"]
+
+
+def _parse_clock(value: str):
+    """Parse common 12-hour and 24-hour time strings."""
+    value = (value or "").strip().upper()
+    for fmt in ("%I:%M %p", "%I %p", "%H:%M"):
+        try:
+            return datetime.strptime(value, fmt).time()
+        except ValueError:
+            continue
+    return None
+
+
+def _doctor_works_at(doctor: dict, appointment_date, appointment_time: str) -> bool:
+    requested_time = _parse_clock(appointment_time)
+    if requested_time is None:
+        return False
+
+    requested_day = appointment_date.strftime("%A").casefold()
+    for item in doctor.get("schedule") or []:
+        if (item.get("day") or "").strip().casefold() != requested_day:
+            continue
+
+        hours = (item.get("hours") or "").strip()
+        times = re.findall(r"\d{1,2}(?::\d{2})?\s*(?:AM|PM)", hours, re.IGNORECASE)
+        if len(times) < 2:
+            continue
+
+        start_time = _parse_clock(times[0])
+        end_time = _parse_clock(times[1])
+        if start_time and end_time and start_time <= requested_time < end_time:
+            return True
+
+    return False
+
+
+async def resolve_department(hospital_id: str, name_or_id: str) -> dict:
+    q = {"hospital_id": hospital_id, "active": True, "$or": [{"department_id": name_or_id}, {"name": {"$regex": f"^{name_or_id.strip()}$", "$options": "i"}}]}
+    return await departments_collection.find_one(q)
+
+
+async def create_invoice(appt: dict, dept: dict, doctor: dict) -> dict:
+    fee = float((doctor or {}).get("consultation_fee") or (dept or {}).get("consultation_fee") or 0)
+    label = f"{appt['department']} consultation" + (f" â€” {doctor['name']}" if doctor else "")
+    inv = {"invoice_id": short_id("INV-"), "hospital_id": appt["hospital_id"], "patient_id": appt["patient_id"],
+           "patient_name": appt["patient_name"], "appointment_id": appt["appointment_id"],
+           "items": [{"label": label, "amount": fee}], "total": fee, "currency": "INR",
+           "status": "pending", "created_at": now(), "updated_at": now()}
+    await invoices_collection.insert_one(inv)
+    return inv
+
+
+async def book(*, hospital_id: str, patient_name: str, department: str, preferred_date: str, preferred_time: str,
+               doctor_id: str = None, patient_id: str = None, source: str = "web", notes: str = None, patient_email: str = None,
+               conversation_id: str = None) -> dict:
+    d = parse_date(preferred_date)
+    if d is None:
+        raise HTTPException(status_code=422, detail="preferred_date must be YYYY-MM-DD")
+    if d < date.today():
+        raise HTTPException(status_code=422, detail="Please choose today or a future date")
+
+    dept = await resolve_department(hospital_id, department) if departments_collection is not None else None
+    if departments_collection is not None and await departments_collection.count_documents({"hospital_id": hospital_id}) and not dept:
+        raise HTTPException(status_code=422, detail="Unknown department")
+    doctor = None
+
+    if source == "voice":
+        if not dept:
+            raise HTTPException(
+                status_code=409,
+                detail="We cannot confirm this department booking right now. Please try another department or contact the hospital.",
+            )
+        if appointments_collection is None or doctors_collection is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Appointment availability cannot be checked right now. Please try again later.",
+            )
+
+        candidates = await doctors_collection.find({
+            "hospital_id": hospital_id,
+            "department_id": dept["department_id"],
+            "available": True,
+        }).sort("name", 1).to_list(100)
+
+        selected_doctor = None
+        for candidate in candidates:
+            if not _doctor_works_at(candidate, d, preferred_time):
+                continue
+
+            # Voice-only: normalize equivalent time formats before clash checking.
+            requested_clock = _parse_clock(preferred_time)
+            if requested_clock is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Please provide a valid appointment time, such as 11:00 AM.",
+                )
+
+            same_day_appointments = await appointments_collection.find({
+                "hospital_id": hospital_id,
+                "doctor_id": candidate["doctor_id"],
+                "preferred_date": preferred_date,
+                "status": {"$in": ACTIVE_STATUSES},
+            }).to_list(500)
+
+            clash = any(
+                _parse_clock(item.get("preferred_time", "")) == requested_clock
+                for item in same_day_appointments
+            )
+            if not clash:
+                selected_doctor = candidate
+                break
+
+        if not selected_doctor:
+            raise HTTPException(
+                status_code=409,
+                detail="No doctor is available in this department at the requested time. Please ask the caller to choose another time.",
+            )
+
+        doctor = selected_doctor
+        doctor_id = doctor["doctor_id"]
+
+    elif doctor_id:
+        # Preserve existing website/staff behavior.
+        doctor = await doctors_collection.find_one({
+            "hospital_id": hospital_id,
+            "doctor_id": doctor_id,
+        })
+        if not doctor:
+            raise HTTPException(status_code=422, detail="Unknown doctor")
+        if dept and doctor.get("department_id") != dept["department_id"]:
+            raise HTTPException(status_code=422, detail="This doctor is not in the selected department")
+        if not doctor.get("available", True):
+            raise HTTPException(status_code=409, detail="This doctor is not taking appointments right now")
+
+        clash = await appointments_collection.find_one({
+            "hospital_id": hospital_id,
+            "doctor_id": doctor_id,
+            "preferred_date": preferred_date,
+            "preferred_time": preferred_time,
+            "status": {"$in": ACTIVE_STATUSES},
+        })
+        if clash:
+            raise HTTPException(status_code=409, detail="This time slot is already booked for the doctor. Please choose another time.")
+
+    patient = await patients_collection.find_one({"patient_id": patient_id}) if patient_id else None
+    appt = {
+        "appointment_id": short_id(), "hospital_id": hospital_id, "patient_id": patient_id,
+        "patient_name": patient_name.strip(), "patient_email": (patient or {}).get("email") or patient_email, "patient_phone": (patient or {}).get("phone"),
+        "department": dept["name"] if dept else department, "department_id": (dept or {}).get("department_id"),
+        "doctor_id": doctor_id, "doctor_name": (doctor or {}).get("name"),
+        "preferred_date": preferred_date, "preferred_time": preferred_time,
+        "status": "confirmed" if source == "voice" else "pending", "source": source, "notes": notes, "history": [], "conversation_id": conversation_id,
+        "created_at": now(), "updated_at": now(),
+    }
+    if appointments_collection is not None:
+        await appointments_collection.insert_one(appt)
+    invoice = await create_invoice(appt, dept, doctor) if (patient_id and invoices_collection is not None) else None
+    if invoice:
+        await appointments_collection.update_one({"appointment_id": appt["appointment_id"]}, {"$set": {"invoice_id": invoice["invoice_id"]}})
+        appt["invoice_id"] = invoice["invoice_id"]
+
+    params = appt_params(appt)
+    await create_notification(hospital_id=hospital_id, audience="admin", ntype="new_appointment", params=params, link="/admin/appointments")
+    if patient_id:
+        await create_notification(hospital_id=hospital_id, audience="patient", patient_id=patient_id, ntype="appointment_booked",
+                                  params=params, link="/account/appointments")
+        await email_patient("appointment_booked", hospital_id=hospital_id, patient=patient, appointment=appt)
+    elif patient_email:
+        await email_patient("appointment_booked", hospital_id=hospital_id, patient_email=patient_email, appointment=appt)
+    return appt

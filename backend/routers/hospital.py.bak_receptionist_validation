@@ -1,0 +1,204 @@
+"""Hospital profile, departments and doctors — public reads, staff-only writes."""
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+
+from auth import require_staff
+from database import hospitals_collection, departments_collection, doctors_collection, require_db
+from services.common import now, serialize, request_hospital_id
+
+router = APIRouter(tags=["hospital"])
+
+PUBLIC_HOSPITAL_FIELDS = ("hospital_id", "name", "tagline", "address", "city", "phone", "email", "emergency_phone",
+                          "timings", "latitude", "longitude", "ai_receptionist_phone", "currency")
+
+
+async def load_hospital(hospital_id: str) -> dict:
+    require_db()
+    h = await hospitals_collection.find_one({"hospital_id": hospital_id})
+    if not h:
+        raise HTTPException(status_code=404, detail="Hospital not found")
+    return h
+
+
+def public_hospital(h: dict) -> dict:
+    return {k: h.get(k) for k in PUBLIC_HOSPITAL_FIELDS}
+
+
+@router.get("/hospital")
+async def get_hospital(hospital_id: str = Depends(request_hospital_id)):
+    return {"hospital": public_hospital(await load_hospital(hospital_id))}
+
+
+@router.get("/hospitals/{hospital_id}")
+async def get_hospital_by_id(hospital_id: str):
+    return {"hospital": public_hospital(await load_hospital(hospital_id.upper()))}
+
+
+class Timing(BaseModel):
+    days: str
+    hours: str
+
+
+class HospitalUpdate(BaseModel):
+    name: Optional[str] = None
+    tagline: Optional[str] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    emergency_phone: Optional[str] = None
+    timings: Optional[List[Timing]] = None
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+    ai_receptionist_phone: Optional[str] = None
+
+
+@router.put("/admin/hospital")
+async def update_hospital(payload: HospitalUpdate, user: dict = Depends(require_staff)):
+    await load_hospital(user["hospital_id"])
+    changes = {k: v for k, v in payload.model_dump().items() if v is not None}
+    changes["updated_at"] = now()
+    await hospitals_collection.update_one({"hospital_id": user["hospital_id"]}, {"$set": changes})
+    return {"hospital": public_hospital(await load_hospital(user["hospital_id"]))}
+
+
+# ----------------------------------------------------------------------------- departments
+class DepartmentIn(BaseModel):
+    name: str = Field(min_length=2, max_length=60)
+    consultation_fee: float = Field(default=500, ge=0)
+    active: bool = True
+
+
+@router.get("/departments")
+async def list_departments(hospital_id: str = Depends(request_hospital_id), include_inactive: bool = False):
+    require_db()
+    q = {"hospital_id": hospital_id} if include_inactive else {"hospital_id": hospital_id, "active": True}
+    return {"departments": serialize(await departments_collection.find(q).sort("name", 1).to_list(200))}
+
+
+@router.get("/admin/departments")
+async def admin_departments(user: dict = Depends(require_staff)):
+    require_db()
+    return {"departments": serialize(await departments_collection.find({"hospital_id": user["hospital_id"]}).sort("name", 1).to_list(200))}
+
+
+@router.post("/admin/departments", status_code=201)
+async def create_department(payload: DepartmentIn, user: dict = Depends(require_staff)):
+    require_db()
+    slug = "-".join(payload.name.lower().split())
+    if await departments_collection.find_one({"hospital_id": user["hospital_id"], "department_id": slug}):
+        raise HTTPException(status_code=409, detail="Department already exists")
+    doc = {"hospital_id": user["hospital_id"], "department_id": slug, **payload.model_dump(), "created_at": now()}
+    await departments_collection.insert_one(doc)
+    return {"department": serialize(doc)}
+
+
+@router.put("/admin/departments/{department_id}")
+async def update_department(department_id: str, payload: DepartmentIn, user: dict = Depends(require_staff)):
+    res = await departments_collection.update_one({"hospital_id": user["hospital_id"], "department_id": department_id},
+                                                  {"$set": {**payload.model_dump(), "updated_at": now()}})
+    if not res.matched_count:
+        raise HTTPException(status_code=404, detail="Department not found")
+    await doctors_collection.update_many({"hospital_id": user["hospital_id"], "department_id": department_id}, {"$set": {"department": payload.name}})
+    return {"department": serialize(await departments_collection.find_one({"hospital_id": user["hospital_id"], "department_id": department_id}))}
+
+
+# ----------------------------------------------------------------------------- doctors
+class ScheduleItem(BaseModel):
+    day: str
+    hours: str
+
+
+class DoctorIn(BaseModel):
+    name: str = Field(min_length=2, max_length=80)
+    specialization: str
+    department_id: str
+    experience_years: int = Field(default=0, ge=0, le=70)
+    qualifications: Optional[str] = ""
+    photo_url: Optional[str] = ""
+    consultation_fee: float = Field(default=500, ge=0)
+    available: bool = True
+    about: Optional[str] = ""
+    schedule: List[ScheduleItem] = []
+
+
+@router.get("/doctors")
+async def list_doctors(hospital_id: str = Depends(request_hospital_id), department_id: Optional[str] = None):
+    require_db()
+    q = {"hospital_id": hospital_id}
+    if department_id:
+        q["department_id"] = department_id
+    return {"doctors": serialize(await doctors_collection.find(q).sort("name", 1).to_list(500))}
+
+
+@router.get("/doctors/{doctor_id}")
+async def get_doctor(doctor_id: str, hospital_id: str = Depends(request_hospital_id)):
+    require_db()
+    d = await doctors_collection.find_one({"hospital_id": hospital_id, "doctor_id": doctor_id})
+    if not d:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+    return {"doctor": serialize(d)}
+
+
+async def _dept_name(hospital_id, department_id):
+    d = await departments_collection.find_one({"hospital_id": hospital_id, "department_id": department_id})
+    if not d:
+        raise HTTPException(status_code=422, detail="Unknown department")
+    return d["name"]
+
+
+@router.post("/admin/doctors", status_code=201)
+async def create_doctor(payload: DoctorIn, user: dict = Depends(require_staff)):
+    require_db()
+    hid = user["hospital_id"]
+    base = "-".join(payload.name.lower().replace("dr.", "").split())
+    doctor_id, n = base, 1
+    while await doctors_collection.find_one({"hospital_id": hid, "doctor_id": doctor_id}):
+        n += 1
+        doctor_id = f"{base}-{n}"
+    doc = {"hospital_id": hid, "doctor_id": doctor_id, **payload.model_dump(),
+           "department": await _dept_name(hid, payload.department_id), "created_at": now()}
+    await doctors_collection.insert_one(doc)
+    return {"doctor": serialize(doc)}
+
+
+@router.put("/admin/doctors/{doctor_id}")
+async def update_doctor(doctor_id: str, payload: DoctorIn, user: dict = Depends(require_staff)):
+    hid = user["hospital_id"]
+    changes = {**payload.model_dump(), "department": await _dept_name(hid, payload.department_id), "updated_at": now()}
+    res = await doctors_collection.update_one({"hospital_id": hid, "doctor_id": doctor_id}, {"$set": changes})
+    if not res.matched_count:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+    return {"doctor": serialize(await doctors_collection.find_one({"hospital_id": hid, "doctor_id": doctor_id}))}
+
+
+@router.delete("/admin/doctors/{doctor_id}")
+async def delete_doctor(doctor_id: str, user: dict = Depends(require_staff)):
+    res = await doctors_collection.delete_one({"hospital_id": user["hospital_id"], "doctor_id": doctor_id})
+    if not res.deleted_count:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+    return {"success": True}
+
+
+# ----------------------------------------------------------------------------- contact form
+class ContactIn(BaseModel):
+    name: str = Field(min_length=2, max_length=80)
+    email: str = Field(min_length=5, max_length=120)
+    phone: Optional[str] = Field(default=None, max_length=20)
+    message: str = Field(min_length=10, max_length=2000)
+
+
+@router.post("/contact", status_code=201)
+async def contact(payload: ContactIn, hospital_id: str = Depends(request_hospital_id)):
+    """Stores the message and notifies hospital staff in the admin dashboard."""
+    from database import db
+    from services.common import short_id
+    from services.notify import create_notification
+    await load_hospital(hospital_id)
+    doc = {"message_id": short_id("MSG-"), "hospital_id": hospital_id, **payload.model_dump(), "status": "new", "created_at": now()}
+    await db["contact_messages"].insert_one(doc)
+    await create_notification(hospital_id=hospital_id, audience="admin", ntype="contact_message", link="/admin/notifications",
+                              params={"patient_name": payload.name, "email": payload.email, "phone": payload.phone or "", "message": payload.message[:140]})
+    return {"success": True, "message_id": doc["message_id"]}

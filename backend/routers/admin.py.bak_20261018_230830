@@ -1,0 +1,129 @@
+"""Admin-only views: dashboard stats, patients, analytics, email delivery logs, escalations."""
+from datetime import datetime, timedelta, timezone, date
+from typing import Literal, Optional
+
+import pytz
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+
+from auth import require_staff
+from database import (appointments_collection, patients_collection, payments_collection, invoices_collection, notifications_collection,
+                      conversations_collection, email_logs_collection, escalations_collection, require_db)
+from services.common import serialize, scoped, now
+from services.email_service import retry_email, email_configured
+
+router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+def _aware(dt):
+    return dt if (dt is None or dt.tzinfo) else dt.replace(tzinfo=timezone.utc)
+
+
+@router.get("/summary")
+async def summary(user: dict = Depends(require_staff)):
+    require_db()
+    hid = user["hospital_id"]
+    today = datetime.now(pytz.timezone("Asia/Kolkata")).date().isoformat()
+    paid = await payments_collection.find({"hospital_id": hid, "status": "paid"}, {"amount": 1}).to_list(100000)
+    return {
+        "total_patients": await patients_collection.count_documents({"hospital_id": hid}),
+        "total_appointments": await appointments_collection.count_documents(scoped(hid)),
+        "todays_appointments": await appointments_collection.count_documents(scoped(hid, {"preferred_date": today, "status": {"$ne": "cancelled"}})),
+        "pending_appointments": await appointments_collection.count_documents(scoped(hid, {"status": {"$in": ["pending", "rescheduled"]}})),
+        "completed_appointments": await appointments_collection.count_documents(scoped(hid, {"status": "completed"})),
+        "completed_today": await appointments_collection.count_documents(scoped(hid, {"status": "completed", "completed_date": today})),
+        "revenue": round(sum(p.get("amount", 0) for p in paid), 2),
+        "pending_invoices": await invoices_collection.count_documents({"hospital_id": hid, "status": {"$in": ["pending", "failed"]}}),
+        "unread_notifications": await notifications_collection.count_documents({"hospital_id": hid, "audience": "admin", "read": False}),
+        "active_conversations": await conversations_collection.count_documents({"hospital_id": hid, "status": "active"}),
+        "open_escalations": await escalations_collection.count_documents(scoped(hid, {"status": "pending"})),
+        "email_configured": email_configured(),
+    }
+
+
+@router.get("/analytics")
+async def analytics(user: dict = Depends(require_staff), days: int = 7):
+    require_db()
+    hid = user["hospital_id"]
+    days = max(1, min(days, 90))
+    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days - 1)
+    buckets = [(start + timedelta(days=i)).date() for i in range(days)]
+    series = {d: {"date": d.isoformat(), "appointments": 0, "conversations": 0, "revenue": 0.0} for d in buckets}
+
+    appts = await appointments_collection.find(scoped(hid, {"created_at": {"$gte": start}}), {"created_at": 1, "department": 1, "source": 1, "status": 1}).to_list(100000)
+    for a in appts:
+        d = _aware(a["created_at"]).date()
+        if d in series:
+            series[d]["appointments"] += 1
+    for c in await conversations_collection.find({"hospital_id": hid, "started_at": {"$gte": start}}, {"started_at": 1}).to_list(100000):
+        d = _aware(c["started_at"]).date()
+        if d in series:
+            series[d]["conversations"] += 1
+    pays = await payments_collection.find({"hospital_id": hid, "status": "paid", "paid_at": {"$gte": start}}, {"paid_at": 1, "amount": 1, "method": 1}).to_list(100000)
+    for p in pays:
+        d = _aware(p["paid_at"]).date()
+        if d in series:
+            series[d]["revenue"] += p.get("amount", 0)
+
+    def count(items, key):
+        out = {}
+        for i in items:
+            out[i.get(key) or "other"] = out.get(i.get(key) or "other", 0) + 1
+        return [{"name": k, "value": v} for k, v in sorted(out.items(), key=lambda x: -x[1])]
+
+    return {"days": days, "series": list(series.values()), "departments": count(appts, "department"),
+            "sources": count(appts, "source"), "statuses": count(appts, "status"), "payment_methods": count(pays, "method")}
+
+
+@router.get("/patients")
+async def patients(user: dict = Depends(require_staff), q: Optional[str] = None):
+    require_db()
+    hid = user["hospital_id"]
+    items = await patients_collection.find({"hospital_id": hid}).sort("created_at", -1).to_list(2000)
+    if q:
+        ql = q.lower()
+        items = [p for p in items if ql in f"{p.get('full_name','')} {p.get('email','')} {p.get('phone','')} {p.get('patient_id','')}".lower()]
+    counts = {}
+    for a in await appointments_collection.find(scoped(hid, {"patient_id": {"$ne": None}}), {"patient_id": 1, "preferred_date": 1}).to_list(100000):
+        c = counts.setdefault(a["patient_id"], {"appointments": 0, "last": None})
+        c["appointments"] += 1
+        c["last"] = max(filter(None, [c["last"], a.get("preferred_date")]), default=None)
+    out = []
+    for p in items:
+        d = serialize(p)
+        d.update({"appointments": counts.get(p["patient_id"], {}).get("appointments", 0), "last_appointment": counts.get(p["patient_id"], {}).get("last")})
+        out.append(d)
+    return {"patients": out}
+
+
+@router.get("/email-logs")
+async def email_logs(user: dict = Depends(require_staff), status: Optional[str] = None):
+    require_db()
+    q = {"hospital_id": user["hospital_id"]}
+    if status:
+        q["status"] = status
+    items = await email_logs_collection.find(q, {"html": 0, "text": 0}).sort("created_at", -1).to_list(200)
+    return {"emails": serialize(items), "configured": email_configured()}
+
+
+@router.post("/email-logs/{email_id}/retry")
+async def retry(email_id: str, user: dict = Depends(require_staff)):
+    doc = await email_logs_collection.find_one({"hospital_id": user["hospital_id"], "email_id": email_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Email not found")
+    doc = await retry_email(email_id)
+    return {"email": serialize({k: v for k, v in doc.items() if k not in ("html", "text")})}
+
+
+class EscalationUpdate(BaseModel):
+    status: Literal["pending", "resolved"]
+
+
+@router.patch("/escalations/{escalation_id}")
+async def update_escalation(escalation_id: str, payload: EscalationUpdate, user: dict = Depends(require_staff)):
+    res = await escalations_collection.update_one(scoped(user["hospital_id"], {"escalation_id": escalation_id}),
+                                                  {"$set": {"status": payload.status, "resolved_by": user["username"], "updated_at": now()}})
+    if not res.matched_count:
+        raise HTTPException(status_code=404, detail="Escalation not found")
+    return {"escalation": serialize(await escalations_collection.find_one({"escalation_id": escalation_id}))}

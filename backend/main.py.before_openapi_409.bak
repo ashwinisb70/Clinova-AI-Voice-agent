@@ -1,0 +1,402 @@
+﻿import os
+import uuid
+import logging
+from datetime import datetime, timezone
+
+from typing import Optional
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
+import httpx
+
+logger = logging.getLogger(__name__)
+
+# Configure logging to show warnings and info in terminal
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%H:%M:%S'
+)
+
+from database import (
+    appointments_collection,
+    escalations_collection,
+    call_logs_collection,
+    users_collection,
+)
+from models import (
+    BookAppointmentRequest,
+    BookAppointmentResponse,
+    FAQRequest,
+    FAQResponse,
+    EscalateRequest,
+    EscalateResponse,
+)
+from faq_knowledge import find_faq_answer
+from auth import (
+    LoginRequest,
+    TokenResponse,
+    hash_password,
+    verify_password,
+    create_access_token,
+    get_current_user,
+    get_optional_user,
+    require_admin,
+    require_staff,
+    STAFF_ROLES,
+    DEFAULT_HOSPITAL_ID,
+)
+from services.common import scoped, serialize, request_hospital_id, agent_authenticated
+from services.booking import book, ACTIVE_STATUSES
+from services.email_service import email_configured
+from services.notify import create_notification
+from services.seed import seed_default_tenant
+from routers import patients, hospital, appointments, billing, notifications, conversations, admin, voice, realtime_ws, extended_appointments, agent_appointments
+from routers.conversations import record_tool_event
+
+load_dotenv()
+
+DEEPGRAM_API_KEY = os.getenv("STT_API_KEY")
+
+app = FastAPI(title="MediAssist â€” Hospital SaaS API (Vextracore Voice AI Agent)")
+
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Temporary: Log validation errors to help debug Bolna requests
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Log validation errors safely (no secrets exposed)."""
+    path = request.url.path
+    method = request.method
+
+    if "/book-appointment" in path:
+        print("\n" + "="*70)
+        print(f"[BOLNA DEBUG] {method} {path} returned 422")
+        print("="*70)
+
+        for error in exc.errors():
+            loc_parts = error.get("loc", [])
+            error_type = error.get("type", "unknown")
+            error_msg = error.get("msg", "Unknown error")
+
+            # Extract field name from location
+            field_name = None
+            if len(loc_parts) > 1:
+                field_name = loc_parts[-1]
+            elif len(loc_parts) == 1:
+                field_name = loc_parts[0]
+
+            print(f"\nfield: {field_name}")
+            print(f"type: {error_type}")
+            print(f"message: {error_msg}")
+            print("-" * 70)
+
+        # Also log via logger
+        logger.warning(f"[BOLNA DEBUG] POST /book-appointment 422: {len(exc.errors())} validation error(s)")
+        print("="*70 + "\n")
+
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
+
+
+for r in (patients, hospital, appointments, billing, notifications, conversations, admin, voice, realtime_ws, extended_appointments, agent_appointments):
+    app.include_router(r.router)
+
+
+def clean_bolna_value(value):
+    """Remove Bolna template syntax from values like '{patient_name}' â†’ 'patient_name'"""
+    if value is None:
+        return None
+
+    value = str(value).strip()
+
+    # Handle empty template braces or truly empty strings
+    if value == "{}" or value == "":
+        return None
+
+    # Remove surrounding curly braces if present (Bolna template syntax)
+    if value.startswith("{") and value.endswith("}"):
+        value = value[1:-1].strip()
+
+    return value or None
+
+
+@app.on_event("startup")
+async def _startup():
+    await seed_default_tenant()
+
+
+async def log_call(tool_name: str, request_data: dict, response_data: dict):
+    if call_logs_collection is None:
+        return
+    try:
+        await call_logs_collection.insert_one({
+            "tool_name": tool_name,
+            "request": request_data,
+            "response": response_data,
+            "timestamp": datetime.now(timezone.utc),
+        })
+    except Exception:
+        pass
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+
+@app.get("/")
+def root():
+    return {"message": "Vextracore Voice AI Agent backend is running"}
+
+
+@app.post("/stt")
+async def speech_to_text(audio: UploadFile = File(...)):
+    if not DEEPGRAM_API_KEY:
+        raise HTTPException(status_code=500, detail="STT_API_KEY is not set in .env")
+
+    audio_bytes = await audio.read()
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://api.deepgram.com/v1/listen",
+            headers={
+                "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                "Content-Type": audio.content_type or "audio/wav",
+            },
+            content=audio_bytes,
+            params={"model": "nova-2", "smart_format": "true"},
+            timeout=30.0,
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail=f"Deepgram error: {response.text}")
+
+    data = response.json()
+    try:
+        transcript = data["results"]["channels"][0]["alternatives"][0]["transcript"]
+    except (KeyError, IndexError):
+        transcript = ""
+
+    return {"transcript": transcript, "raw": data}
+
+
+@app.post("/book-appointment", response_model=BookAppointmentResponse)
+async def book_appointment(
+    payload: BookAppointmentRequest,
+    user: Optional[dict] = Depends(get_optional_user),
+    x_agent_key: Optional[str] = Header(default=None),
+    x_conversation_id: Optional[str] = Header(default=None),
+    hospital_id_header: str = Depends(request_hospital_id),
+):
+    """Same request/response as before. Now requires authentication:
+    - a logged-in patient (Bearer token, role=patient) â€” booking is linked to their account; or
+    - the Bolna agent, sending the shared secret in the X-Agent-Key header."""
+    is_agent = agent_authenticated(x_agent_key)
+    if user and user.get("role") == "patient":
+        hid, patient_id, source = user["hospital_id"], user["username"], "web"
+    elif agent_authenticated(x_agent_key):
+        hid, patient_id, source = hospital_id_header, None, "voice"
+    else:
+        raise HTTPException(status_code=401, detail="Please login to book an appointment")
+
+    # Normalize Bolna values (remove curly braces from template syntax)
+    clean_patient_name = clean_bolna_value(payload.patient_name)
+    clean_department = clean_bolna_value(payload.department)
+    clean_preferred_date = clean_bolna_value(payload.preferred_date)
+    clean_preferred_time = clean_bolna_value(payload.preferred_time)
+    clean_doctor_id = clean_bolna_value(payload.doctor_id)
+    clean_notes = clean_bolna_value(payload.notes)
+    clean_patient_email = clean_bolna_value(payload.patient_email)
+
+    existing = None
+    if is_agent and x_conversation_id and appointments_collection is not None:
+        existing = await appointments_collection.find_one({
+            "hospital_id": hid, "conversation_id": x_conversation_id, "patient_name": clean_patient_name,
+            "preferred_date": clean_preferred_date, "preferred_time": clean_preferred_time, "status": {"$in": ACTIVE_STATUSES}})
+    appt = existing or await book(hospital_id=hid, patient_name=clean_patient_name, department=clean_department,
+                                  preferred_date=clean_preferred_date, preferred_time=clean_preferred_time,
+                                  doctor_id=clean_doctor_id, patient_id=patient_id, source=source, notes=clean_notes,
+                                  patient_email=clean_patient_email, conversation_id=x_conversation_id if is_agent else None)
+
+    response = BookAppointmentResponse(
+        success=True,
+        message=(
+            f"Appointment confirmed for {appt['patient_name']} "
+            f"in {appt['department']} with {appt.get('doctor_name') or 'the assigned doctor'} "
+            f"on {appt['preferred_date']} at {appt['preferred_time']}."
+            if appt["status"] == "confirmed"
+            else (
+                f"Appointment request received for {appt['patient_name']} "
+                f"in {appt['department']} on {appt['preferred_date']}"
+                + (f" at {appt['preferred_time']}" if appt['preferred_time'] else "")
+                + ". The hospital will confirm it shortly."
+            )
+        ),
+        appointment_id=appt["appointment_id"],
+        status=appt["status"],
+        invoice_id=appt.get("invoice_id"),
+        email_queued=(bool(patient_id) or bool(clean_patient_email)) and email_configured(),
+    )
+
+    await log_call("book_appointment", payload.model_dump(), response.model_dump())
+    await record_tool_event(hid, x_conversation_id, f"Appointment {appt['appointment_id']} requested ({appt['department']}, {payload.preferred_date} {payload.preferred_time or ''})",
+                            patient_name=payload.patient_name, topic="Book an appointment")
+    return response
+
+
+@app.post("/faq", response_model=FAQResponse)
+async def check_patient_faq(payload: FAQRequest):
+    answer = find_faq_answer(payload.question, payload.topic)
+    response = FAQResponse(success=True, answer=answer)
+    await log_call("check_patient_faq", payload.model_dump(), response.model_dump())
+    return response
+
+
+@app.post("/escalate", response_model=EscalateResponse)
+async def escalate_to_staff(
+    payload: EscalateRequest,
+    hospital_id: str = Depends(request_hospital_id),
+    x_conversation_id: Optional[str] = Header(default=None),
+):
+    escalation_id = str(uuid.uuid4())[:8]
+
+    escalation_doc = {
+        "escalation_id": escalation_id,
+        "hospital_id": hospital_id,
+        "conversation_id": x_conversation_id,
+        "patient_name": payload.patient_name,
+        "reason": payload.reason,
+        "urgency": payload.urgency,
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc),
+    }
+
+    if escalations_collection is not None:
+        try:
+            await escalations_collection.insert_one(escalation_doc)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to save escalation: {str(e)}")
+
+    response = EscalateResponse(
+        success=True,
+        message="This has been flagged for our staff and they will assist you shortly.",
+        escalation_id=escalation_id,
+    )
+
+    await log_call("escalate_to_staff", payload.model_dump(), response.model_dump())
+    await create_notification(hospital_id=hospital_id, audience="admin", ntype="new_escalation", link="/admin/escalations",
+                              params={"patient_name": payload.patient_name or "A caller", "reason": payload.reason, "urgency": payload.urgency})
+    await record_tool_event(hospital_id, x_conversation_id, f"Escalated to staff: {payload.reason}", status="escalated",
+                            patient_name=payload.patient_name)
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Authentication (Day 14)
+# ---------------------------------------------------------------------------
+
+@app.post("/auth/register", status_code=201)
+async def register_user(payload: LoginRequest, current: Optional[dict] = Depends(get_optional_user)):
+    """Staff accounts. The very first account becomes the hospital admin; after that only an
+    admin can create staff accounts (previously anyone could register as staff)."""
+    if users_collection is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    first_user = await users_collection.count_documents({}) == 0
+    if not first_user and (not current or current.get("role") != "admin"):
+        raise HTTPException(status_code=403, detail="Only a hospital admin can create staff accounts")
+
+    existing = await users_collection.find_one({"username": payload.username})
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    await users_collection.insert_one({
+        "username": payload.username,
+        "password_hash": hash_password(payload.password),
+        "role": "admin" if first_user else "staff",
+        "hospital_id": (current or {}).get("hospital_id") or DEFAULT_HOSPITAL_ID,
+        "created_at": datetime.now(timezone.utc),
+    })
+    return {"success": True, "message": "User registered", "role": "admin" if first_user else "staff"}
+
+
+@app.post("/auth/login", response_model=TokenResponse)
+async def login(payload: LoginRequest):
+    if users_collection is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    user = await users_collection.find_one({"username": payload.username})
+    if not user or not verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+
+    token = create_access_token(username=user["username"], role=user.get("role", "staff"),
+                                hospital_id=user.get("hospital_id") or DEFAULT_HOSPITAL_ID)
+    return TokenResponse(access_token=token)
+
+
+@app.get("/auth/me")
+async def auth_me(current: dict = Depends(require_staff)):
+    user = await users_collection.find_one({"username": current["username"]})
+    return {"username": current["username"], "role": current["role"], "hospital_id": current["hospital_id"],
+            "display_name": (user or {}).get("display_name")}
+
+
+@app.get("/appointments")
+async def list_appointments(current_user: dict = Depends(get_current_user), status: Optional[str] = None, limit: int = 50):
+    """Staff: every appointment of their hospital. Patients: only their own."""
+    if appointments_collection is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    extra = {}
+    if current_user["role"] == "patient":
+        extra["patient_id"] = current_user["username"]
+    elif current_user["role"] not in STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    if status:
+        extra["status"] = status
+    docs = await appointments_collection.find(scoped(current_user["hospital_id"], extra)).sort("created_at", -1).to_list(max(1, min(limit, 1000)))
+    return {"appointments": serialize(docs)}
+
+
+@app.get("/escalations")
+async def list_escalations(current_user: dict = Depends(require_staff)):
+    if escalations_collection is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    docs = await escalations_collection.find(scoped(current_user["hospital_id"])).sort("created_at", -1).to_list(200)
+    return {"escalations": serialize(docs)}
+
+
+# ---------------------------------------------------------------------------
+# Dashboard summary (Day 15) â€” protected, gives the admin dashboard
+# a single endpoint for counts + recent activity instead of multiple calls.
+# ---------------------------------------------------------------------------
+
+@app.get("/dashboard/summary")
+async def dashboard_summary(current_user: dict = Depends(require_staff)):
+    if appointments_collection is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    hid = current_user["hospital_id"]
+    return {
+        "total_appointments": await appointments_collection.count_documents(scoped(hid)),
+        "total_escalations": await escalations_collection.count_documents(scoped(hid)),
+        "pending_escalations": await escalations_collection.count_documents(scoped(hid, {"status": "pending"})),
+        "total_calls_logged": await call_logs_collection.count_documents({}),
+        "recent_appointments": serialize(await appointments_collection.find(scoped(hid)).sort("created_at", -1).to_list(5)),
+        "recent_escalations": serialize(await escalations_collection.find(scoped(hid)).sort("created_at", -1).to_list(5)),
+    }
+

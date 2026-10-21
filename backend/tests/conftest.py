@@ -1,0 +1,27 @@
+﻿"""Hermetic test environment, applied before any app module is imported.
+
+Values here override backend/.env so tests never depend on the developer's real configuration,
+never reach MongoDB Atlas, never send real email, and never call Razorpay or Bolna."""
+import os
+
+os.environ.update({
+    "MONGODB_URI": "mongomock://",
+    "JWT_SECRET": "test",
+    "AGENT_API_KEY": "agent-secret",
+    "DEFAULT_HOSPITAL_ID": "CITY001",
+    "HOSPITAL_NAME": "City Hospital",
+    "HOSPITAL_ADDRESS": "123 Health Street, Bengaluru, Karnataka 560001",
+    "EMAIL_HOST": "",
+    "EMAIL_PORT": "8025",
+    "EMAIL_FROM": "",
+    "EMAIL_USE_TLS": "false",
+    "EMAIL_USE_SSL": "false",
+    "EMAIL_USERNAME": "",
+    "EMAIL_PASSWORD": "",
+    "RAZORPAY_KEY_ID": "",
+    "RAZORPAY_KEY_SECRET": "",
+    "RAZORPAY_WEBHOOK_SECRET": "",
+    "FRONTEND_URL": "http://localhost:5173",
+})
+
+

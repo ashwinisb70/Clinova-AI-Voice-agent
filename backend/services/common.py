@@ -1,0 +1,96 @@
+﻿"""Shared helpers: tenancy scoping, ids, serialisation, agent (Bolna) authentication."""
+import os
+import secrets
+import uuid
+from datetime import datetime, date, timezone
+from zoneinfo import ZoneInfo
+from typing import Optional
+
+from fastapi import Header, HTTPException, Query
+from auth import DEFAULT_HOSPITAL_ID
+
+AGENT_API_KEY = os.getenv("AGENT_API_KEY")  # shared secret for Bolna tool calls / webhooks
+
+
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def today_local() -> date:
+    """Current calendar date in the hospital's Asia/Kolkata timezone."""
+    return datetime.now(ZoneInfo("Asia/Kolkata")).date()
+
+
+def short_id(prefix: str = "") -> str:
+    return f"{prefix}{uuid.uuid4().hex[:8].upper()}"
+
+
+def tenant_scope(hospital_id: str) -> dict:
+    """Mongo filter for one hospital. Records created before multi-tenancy (no hospital_id)
+    belong to the default tenant only â€” never to any other hospital."""
+    if hospital_id == DEFAULT_HOSPITAL_ID:
+        return {"$or": [{"hospital_id": hospital_id}, {"hospital_id": {"$exists": False}}, {"hospital_id": None}]}
+    return {"hospital_id": hospital_id}
+
+
+def scoped(hospital_id: str, extra: Optional[dict] = None) -> dict:
+    parts = [tenant_scope(hospital_id)]
+    if extra:
+        parts.append(extra)
+    return {"$and": parts} if len(parts) > 1 else parts[0]
+
+
+def serialize(doc):
+    """Make a Mongo document JSON-safe (ObjectId â†’ str, datetimes â†’ ISO) and drop secrets."""
+    if doc is None:
+        return None
+    if isinstance(doc, list):
+        return [serialize(d) for d in doc]
+    out = {}
+    for k, v in doc.items():
+        if k in ("password_hash",):
+            continue
+        if k == "_id":
+            out[k] = str(v)
+        elif isinstance(v, datetime):
+            out[k] = (v if v.tzinfo else v.replace(tzinfo=timezone.utc)).isoformat()
+        elif isinstance(v, dict):
+            out[k] = serialize(v)
+        elif isinstance(v, list):
+            out[k] = [serialize(x) if isinstance(x, dict) else x for x in v]
+        else:
+            out[k] = v
+    return out
+
+
+def request_hospital_id(x_hospital_id: Optional[str] = Header(default=None)) -> str:
+    """Public (patient-site) requests identify their hospital with the X-Hospital-Id header."""
+    hid = (x_hospital_id or DEFAULT_HOSPITAL_ID).strip().upper()
+    return hid or DEFAULT_HOSPITAL_ID
+
+
+def agent_authenticated(x_agent_key: Optional[str] = None, key: Optional[str] = None) -> bool:
+    supplied = x_agent_key or key
+    return bool(AGENT_API_KEY and supplied and secrets.compare_digest(supplied, AGENT_API_KEY))
+
+
+def require_agent(x_agent_key: Optional[str] = Header(default=None), key: Optional[str] = Query(default=None)):
+    """Bolna authenticates with the X-Agent-Key header (tools) or ?key= (webhook URL)."""
+    if not AGENT_API_KEY:
+        raise HTTPException(status_code=503, detail="AGENT_API_KEY is not configured on the server")
+    if not agent_authenticated(x_agent_key, key):
+        raise HTTPException(status_code=401, detail="Invalid agent key")
+    return True
+
+
+def parse_date(value: str) -> Optional[date]:
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def pretty_date(value: str) -> str:
+    d = parse_date(value)
+    return d.strftime("%d %B %Y").lstrip("0") if d else str(value)
+

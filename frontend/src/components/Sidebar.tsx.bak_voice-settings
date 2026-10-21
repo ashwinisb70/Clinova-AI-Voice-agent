@@ -1,0 +1,155 @@
+import React, { useState } from 'react'
+import { Link, useLocation } from 'react-router-dom'
+import {
+  LayoutDashboard, Users, Calendar, FileText, CreditCard, Bell,
+  Mail, Clock, Building2, Stethoscope, Menu, X, LogOut, User
+} from 'lucide-react'
+import { useLanguage } from '../context/LanguageContext'
+import { useAuth } from '../context/AuthContext'
+
+interface SidebarProps {
+  onLogout: () => void
+}
+
+export const Sidebar: React.FC<SidebarProps> = ({ onLogout }) => {
+  const [isOpen, setIsOpen] = useState(true)
+  const [showLogoutConfirm, setShowLogoutConfirm] = useState(false)
+  const location = useLocation()
+  const { t } = useLanguage()
+  const { user } = useAuth()
+
+  const navItems = [
+    { icon: LayoutDashboard, label: t('nav.dashboard'), path: '/dashboard' },
+    { icon: Users, label: t('nav.patients'), path: '/patients' },
+    { icon: Building2, label: t('nav.departments'), path: '/departments' },
+    { icon: Stethoscope, label: t('nav.doctors'), path: '/doctors' },
+    { icon: Calendar, label: t('nav.appointments'), path: '/appointments' },
+    { icon: Clock, label: t('nav.history'), path: '/history' },
+    { icon: FileText, label: t('nav.billing'), path: '/billing' },
+    { icon: CreditCard, label: t('nav.payments'), path: '/payments' },
+    { icon: Bell, label: t('nav.notifications'), path: '/notifications' },
+    { icon: Mail, label: t('nav.email'), path: '/email' },
+  ]
+
+  const isActive = (path: string) => {
+    return location.pathname === path || location.pathname.startsWith(path + '/')
+  }
+
+  return (
+    <>
+      {/* Toggle Button for Mobile */}
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className="fixed top-4 left-4 z-50 md:hidden bg-navy-900 text-white p-2 rounded-lg"
+      >
+        {isOpen ? <X size={24} /> : <Menu size={24} />}
+      </button>
+
+      {/* Backdrop for Mobile */}
+      {isOpen && (
+        <div
+          className="fixed inset-0 bg-black/50 z-30 md:hidden"
+          onClick={() => setIsOpen(false)}
+        ></div>
+      )}
+
+      {/* Sidebar */}
+      <aside
+        className={`fixed left-0 top-0 bottom-0 w-64 bg-navy-900 text-white flex flex-col z-40 transition-transform duration-300 ${
+          !isOpen ? '-translate-x-full' : ''
+        }`}
+      >
+        {/* Logo */}
+        <div className="px-6 py-6 border-b border-navy-700">
+          <Link to="/dashboard" className="flex items-center gap-2">
+            <div className="w-10 h-10 bg-teal-600 rounded-lg flex items-center justify-center font-bold text-lg">
+              C
+            </div>
+            <div>
+              <h1 className="text-xl font-bold">CLINOVA</h1>
+              <p className="text-xs text-navy-300">Hospital Management</p>
+            </div>
+          </Link>
+        </div>
+
+        {/* Navigation */}
+        <nav className="flex-1 overflow-y-auto py-6 px-3 space-y-1">
+          {navItems.map((item) => {
+            const Icon = item.icon
+            return (
+              <Link
+                key={item.path}
+                to={item.path}
+                onClick={() => setIsOpen(false)}
+                className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
+                  isActive(item.path)
+                    ? 'bg-teal-600 text-white'
+                    : 'text-navy-100 hover:bg-navy-800'
+                }`}
+              >
+                <Icon size={20} />
+                <span className="text-sm font-medium">{item.label}</span>
+              </Link>
+            )
+          })}
+        </nav>
+
+        {/* Footer */}
+        <div className="border-t border-navy-700 p-3 space-y-3">
+          {/* User Profile */}
+          <Link
+            to="/profile"
+            onClick={() => setIsOpen(false)}
+            className="flex items-center gap-3 px-4 py-3 text-navy-100 hover:bg-navy-800 rounded-lg transition-colors"
+          >
+            <User size={20} />
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-medium truncate">{user?.display_name || user?.username}</div>
+              <div className="text-xs text-navy-300 capitalize">{user?.role}</div>
+            </div>
+          </Link>
+
+          {/* Logout */}
+          <button
+            onClick={() => setShowLogoutConfirm(true)}
+            className="w-full flex items-center gap-3 px-4 py-3 text-red-400 hover:bg-red-900/20 rounded-lg transition-colors text-sm font-medium"
+          >
+            <LogOut size={20} />
+            {t('nav.logout')}
+          </button>
+        </div>
+      </aside>
+
+      {/* Logout Confirmation Modal */}
+      {showLogoutConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/50" onClick={() => setShowLogoutConfirm(false)}></div>
+          <div className="relative bg-white dark:bg-gray-800 rounded-lg shadow-xl p-6 w-full max-w-sm mx-4">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">{t('nav.logout')}</h3>
+            <p className="text-gray-600 dark:text-gray-400 mb-6">{t('auth.logoutConfirm')}</p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setShowLogoutConfirm(false)}
+                className="flex-1 px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors font-medium"
+              >
+                {t('common.cancel')}
+              </button>
+              <button
+                onClick={() => {
+                  setShowLogoutConfirm(false)
+                  onLogout()
+                }}
+                className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 dark:bg-red-700 dark:hover:bg-red-600 text-white rounded-lg transition-colors font-medium"
+              >
+                {t('nav.logout')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Main Content Offset */}
+      <div className={`transition-all duration-300 ${isOpen ? 'md:ml-64' : ''}`}></div>
+    </>
+  )
+}

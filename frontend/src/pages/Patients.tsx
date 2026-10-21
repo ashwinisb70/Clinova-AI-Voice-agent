@@ -1,0 +1,275 @@
+import React, { useState, useEffect } from 'react'
+import { AppLayout } from '../components/AppLayout'
+import { useLanguage } from '../context/LanguageContext'
+import { Link } from 'react-router-dom'
+import { adminAPI } from '../services/api'
+import { Search, AlertCircle, Eye, Phone, Mail, Plus, X } from 'lucide-react'
+
+interface Patient {
+  patient_id: string
+  full_name: string
+  email: string
+  phone: string
+  appointments: number
+  last_appointment?: string
+  created_at: string
+}
+
+export const Patients: React.FC = () => {
+  const { t } = useLanguage()
+  const [patients, setPatients] = useState<Patient[]>([])
+  const [filteredPatients, setFilteredPatients] = useState<Patient[]>([])
+  const [searchQuery, setSearchQuery] = useState('')
+  const [isLoading, setIsLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [showCreateForm, setShowCreateForm] = useState(false)
+  const [isSaving, setIsSaving] = useState(false)
+  const [formError, setFormError] = useState<string | null>(null)
+  const [successMessage, setSuccessMessage] = useState<string | null>(null)
+  const [newPatient, setNewPatient] = useState({ full_name: '', email: '', phone: '' })
+
+  const submitNewPatient = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setFormError(null)
+    setSuccessMessage(null)
+
+    const full_name = newPatient.full_name.trim()
+    const email = newPatient.email.trim().toLowerCase()
+    const phone = newPatient.phone.replace(/[\s\-()]/g, '')
+
+    if (full_name.length < 2) {
+      setFormError('Enter the patient?s full name.')
+      return
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      setFormError('Enter a valid email address.')
+      return
+    }
+    if (!/^\+?[0-9]{10,13}$/.test(phone)) {
+      setFormError('Enter a valid phone number (10?13 digits, optional +).')
+      return
+    }
+
+    setIsSaving(true)
+    try {
+      await adminAPI.createPatient({ full_name, email, phone })
+      const response = await adminAPI.getPatients()
+      const list = response.data.patients || []
+      setPatients(list)
+      setFilteredPatients(list)
+      setSearchQuery('')
+      setNewPatient({ full_name: '', email: '', phone: '' })
+      setShowCreateForm(false)
+      setSuccessMessage('Patient added successfully.')
+    } catch (err: any) {
+      const detail = err.response?.data?.detail
+      const message = Array.isArray(detail)
+        ? detail.map((item: any) => item.msg).filter(Boolean).join(' ')
+        : typeof detail === 'string'
+          ? detail
+          : 'Could not create the patient. Please try again.'
+      setFormError(message)
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
+  useEffect(() => {
+    const loadPatients = async () => {
+      try {
+        const response = await adminAPI.getPatients()
+        setPatients(response.data.patients || [])
+        setFilteredPatients(response.data.patients || [])
+      } catch (err: any) {
+        setError(err.response?.data?.detail || t('common.error'))
+      } finally {
+        setIsLoading(false)
+      }
+    }
+
+    loadPatients()
+  }, [t])
+
+  useEffect(() => {
+    const query = searchQuery.toLowerCase()
+    const filtered = patients.filter(p =>
+      p.full_name.toLowerCase().includes(query) ||
+      p.email.toLowerCase().includes(query) ||
+      p.phone.includes(query)
+    )
+    setFilteredPatients(filtered)
+  }, [searchQuery, patients])
+
+  if (isLoading) {
+    return (
+      <AppLayout title={t('patients.title')}>
+        <div className="flex items-center justify-center min-h-96">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-teal-600"></div>
+        </div>
+      </AppLayout>
+    )
+  }
+
+  if (error) {
+    return (
+      <AppLayout title={t('patients.title')}>
+        <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-4 flex items-center gap-3">
+          <AlertCircle className="text-red-600 dark:text-red-400" size={24} />
+          <div>
+            <p className="font-medium text-red-900 dark:text-red-400">{t('common.error')}</p>
+            <p className="text-red-700 dark:text-red-300 text-sm">{error}</p>
+          </div>
+        </div>
+      </AppLayout>
+    )
+  }
+
+  return (
+    <AppLayout title={t('patients.title')}>
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        {/* Header */}
+        <div className="mb-8 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+          <p className="text-gray-600 dark:text-gray-400">Manage and view all patient records</p>
+          <button
+            type="button"
+            onClick={() => { setShowCreateForm(!showCreateForm); setFormError(null); setSuccessMessage(null) }}
+            className="inline-flex items-center justify-center gap-2 rounded-lg bg-teal-600 px-4 py-2.5 font-medium text-white hover:bg-teal-700"
+          >
+            {showCreateForm ? <X size={18} /> : <Plus size={18} />}
+            {showCreateForm ? 'Cancel' : 'Add Patient'}
+          </button>
+        </div>
+
+        {successMessage && (
+          <div role="status" className="mb-5 rounded-lg border border-green-200 bg-green-50 p-3 text-green-800 dark:border-green-800 dark:bg-green-900/20 dark:text-green-300">
+            {successMessage}
+          </div>
+        )}
+
+        {showCreateForm && (
+          <form onSubmit={submitNewPatient} className="mb-6 rounded-xl border border-gray-200 bg-white p-5 dark:border-gray-700 dark:bg-gray-800">
+            <h2 className="mb-4 text-lg font-semibold text-gray-900 dark:text-white">Add a new patient</h2>
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                Full name
+                <input
+                  required minLength={2} maxLength={80}
+                  value={newPatient.full_name}
+                  onChange={e => setNewPatient({ ...newPatient, full_name: e.target.value })}
+                  className="mt-1 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-gray-900 dark:border-gray-600 dark:bg-gray-900 dark:text-white"
+                  placeholder="Patient full name"
+                />
+              </label>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                Email
+                <input
+                  required type="email"
+                  value={newPatient.email}
+                  onChange={e => setNewPatient({ ...newPatient, email: e.target.value })}
+                  className="mt-1 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-gray-900 dark:border-gray-600 dark:bg-gray-900 dark:text-white"
+                  placeholder="patient@example.com"
+                />
+              </label>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                Phone
+                <input
+                  required type="tel" inputMode="tel"
+                  value={newPatient.phone}
+                  onChange={e => setNewPatient({ ...newPatient, phone: e.target.value })}
+                  className="mt-1 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-gray-900 dark:border-gray-600 dark:bg-gray-900 dark:text-white"
+                  placeholder="10-digit phone number"
+                />
+              </label>
+            </div>
+            {formError && (
+              <p role="alert" className="mt-4 rounded-lg bg-red-50 p-3 text-sm text-red-700 dark:bg-red-900/20 dark:text-red-300">
+                {formError}
+              </p>
+            )}
+            <div className="mt-5 flex justify-end">
+              <button
+                type="submit" disabled={isSaving}
+                className="rounded-lg bg-teal-600 px-5 py-2.5 font-medium text-white hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isSaving ? 'Saving?' : 'Save Patient'}
+              </button>
+            </div>
+          </form>
+        )}
+
+        {/* Search */}
+        <div className="mb-6">
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 dark:text-gray-500" size={20} />
+            <input
+              type="text"
+              placeholder={t('common.search')}
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full pl-10 pr-4 py-3 border-2 border-gray-200 dark:border-gray-600 rounded-lg focus:outline-none focus:border-teal-600 dark:focus:border-teal-500 text-gray-900 dark:text-white bg-white dark:bg-gray-800"
+            />
+          </div>
+        </div>
+
+        {/* Patients Table */}
+        <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 overflow-hidden">
+          {filteredPatients.length > 0 ? (
+            <table className="w-full">
+              <thead className="bg-gray-50 dark:bg-gray-700 border-b border-gray-200 dark:border-gray-600">
+                <tr>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase">{t('patients.patientName')}</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase">{t('patients.email')}</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase">{t('patients.phone')}</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase">{t('patients.appointments')}</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase">{t('patients.lastAppointment')}</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase">Action</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                {filteredPatients.map((patient) => (
+                  <tr key={patient.patient_id} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
+                    <td className="px-6 py-4 text-sm font-medium text-navy-900 dark:text-gray-100">{patient.full_name}</td>
+                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 flex items-center gap-2">
+                      <Mail size={16} className="text-gray-400 dark:text-gray-500" />
+                      {patient.email}
+                    </td>
+                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 flex items-center gap-2">
+                      <Phone size={16} className="text-gray-400 dark:text-gray-500" />
+                      {patient.phone}
+                    </td>
+                    <td className="px-6 py-4 text-sm font-semibold text-navy-900 dark:text-gray-100">{patient.appointments}</td>
+                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
+                      {patient.last_appointment ? new Date(patient.last_appointment).toLocaleDateString() : 'â€”'}
+                    </td>
+                    <td className="px-6 py-4 text-sm">
+                      <Link
+                        to={`/patients/${patient.patient_id}`}
+                        className="inline-flex items-center gap-1 px-3 py-1.5 bg-teal-100 dark:bg-teal-900/30 text-teal-600 dark:text-teal-400 rounded hover:bg-teal-200 dark:hover:bg-teal-900/50 transition-colors font-medium"
+                      >
+                        <Eye size={16} />
+                        View
+                      </Link>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <div className="text-center py-12">
+              <AlertCircle className="text-gray-400 dark:text-gray-500 mx-auto mb-3" size={32} />
+              <p className="text-gray-500 dark:text-gray-400 font-medium">{t('common.noResults')}</p>
+            </div>
+          )}
+        </div>
+
+        {/* Summary */}
+        <div className="mt-6 text-sm text-gray-600 dark:text-gray-400">
+          Showing <span className="font-semibold text-navy-900 dark:text-gray-200">{filteredPatients.length}</span> of <span className="font-semibold text-navy-900 dark:text-gray-200">{patients.length}</span> patients
+        </div>
+      </div>
+    </AppLayout>
+  )
+}
+
+export default Patients
+
